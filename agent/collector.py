@@ -2,9 +2,11 @@ import psutil
 import time
 import platform
 import uuid
+import os
+import sys
 import requests
 
-BACKEND_URL = "http://localhost:5000/api/telemetry"
+BACKEND_URL = os.getenv("REVIVE_BACKEND_URL", "http://localhost:5000/api/telemetry")
 DEVICE_ID = str(uuid.getnode())
 
 def get_system_metrics():
@@ -38,10 +40,10 @@ def get_system_metrics():
             "boot_time_sec": boot_time,
             "battery_health_pct": round(bat_pct, 1),
             "battery_charging": bat_charging,
-            "cpu_temp_c": 45.0, # Standard fallback if temp sensors are restricted
-            "startup_apps_count": 8,
+            "cpu_temp_c": float(os.getenv("REVIVE_CPU_TEMP_C", "45.0")),
+            "startup_apps_count": int(os.getenv("REVIVE_STARTUP_APPS", "8")),
             "background_processes_count": processes,
-            "cache_size_gb": 4.5
+            "cache_size_gb": float(os.getenv("REVIVE_CACHE_SIZE_GB", "4.5"))
         }
     }
 
@@ -55,6 +57,9 @@ def send_telemetry():
 
 if __name__ == "__main__":
     print(f"ReVive Agent active. Monitoring Device ID: {DEVICE_ID}")
+    once = "--once" in sys.argv
     while True:
         send_telemetry()
-        time.sleep(5)
+        if once:
+            break
+        time.sleep(float(os.getenv("REVIVE_INTERVAL_SECONDS", "5")))

@@ -8,10 +8,10 @@ app.use(cors());
 app.use(express.json());
 
 const dbPool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: 'your_mysql_password',
-  database: 'revive_db',
+  host: process.env.MYSQL_HOST || 'localhost',
+  user: process.env.MYSQL_USER || 'root',
+  password: process.env.MYSQL_PASSWORD || 'your_mysql_password',
+  database: process.env.MYSQL_DATABASE || 'revive_db',
   waitForConnections: true,
   connectionLimit: 10
 });
@@ -22,12 +22,73 @@ let preferences = {
   automaticDiagnostics: true,
   recoveryMode: 'balanced'
 };
-let latestTelemetry = null;
+const demoTelemetry = {
+  device_id: 'demo-revive-device',
+  device_name: 'Dell Latitude 5490',
+  os_name: 'Windows',
+  os_version: '11',
+  total_ram_gb: 16,
+  total_storage_gb: 256,
+  metrics: {
+    cpu_usage_pct: 19,
+    ram_usage_pct: 69,
+    storage_usage_pct: 91,
+    boot_time_sec: 72,
+    battery_health_pct: 83,
+    battery_charging: true,
+    cpu_temp_c: 58,
+    startup_apps_count: 8,
+    background_processes_count: 64,
+    cache_size_gb: 7.5
+  },
+  received_at: new Date().toISOString()
+};
+let latestTelemetry = demoTelemetry;
+let latestTelemetryReceivedAt = null;
+const telemetryHistory = Array.from({ length: 6 }, (_, index) => ({
+  recorded_at: new Date(Date.now() - (5 - index) * 30 * 24 * 60 * 60 * 1000).toISOString(),
+  health: [78, 76, 73, 70, 66, 61][index],
+  memory: [48, 54, 59, 66, 75, 83][index],
+  storage: [73, 77, 80, 84, 88, 91][index]
+}));
+
+function getScores(telemetry = latestTelemetry) {
+  const metrics = telemetry.metrics;
+  const performance = Math.max(10, Math.round(100 - (metrics.cpu_usage_pct * 0.4) - (metrics.boot_time_sec * 0.2)));
+  const memory = Math.max(10, Math.round(100 - metrics.ram_usage_pct));
+  const storage = Math.max(10, Math.round(100 - metrics.storage_usage_pct));
+  const battery = Math.round(metrics.battery_health_pct);
+  const thermal = Math.max(10, Math.round(100 - Math.max(0, (metrics.cpu_temp_c - 40) * 1.5)));
+  const overall = Math.round(performance * .25 + memory * .25 + storage * .2 + battery * .15 + thermal * .15);
+  return { overall, performance, memory, storage, battery, thermal };
+}
+
+function getRecommendations(telemetry = latestTelemetry) {
+  const { metrics } = telemetry;
+  return [
+    { id: 'startup', title: 'Disable non-essential startup apps', description: 'Reduce boot latency and background work.', impact: '+12 health', difficulty: 'Easy', enabled: metrics.startup_apps_count > 5 },
+    { id: 'storage', title: 'Recover storage headroom', description: `Free approximately ${Math.max(15, Math.round(telemetry.total_storage_gb * .06 || 15))} GB without removing personal files.`, impact: '+8 health', difficulty: 'Easy', enabled: metrics.storage_usage_pct > 85 },
+    { id: 'cache', title: 'Clear system and application cache', description: 'Remove temporary files that are safe to regenerate.', impact: '+5 health', difficulty: 'Easy', enabled: metrics.cache_size_gb > 3 },
+    { id: 'background', title: 'Review background processes', description: 'Reduce memory pressure from apps running while idle.', impact: '+6 health', difficulty: 'Medium', enabled: metrics.background_processes_count > 50 }
+  ];
+}
+
+function isTelemetryLive() {
+  return latestTelemetryReceivedAt !== null && Date.now() - latestTelemetryReceivedAt < 30000;
+}
 
 // Sync Telemetry Data
 app.post('/api/telemetry', async (req, res) => {
   const { device_id, device_name, os_name, os_version, total_ram_gb, total_storage_gb, metrics } = req.body;
   latestTelemetry = { device_id, device_name, os_name, os_version, total_ram_gb, total_storage_gb, metrics, received_at: new Date().toISOString() };
+  latestTelemetryReceivedAt = Date.now();
+  telemetryHistory.push({
+    recorded_at: latestTelemetry.received_at,
+    health: getScores(latestTelemetry).overall,
+    memory: metrics.ram_usage_pct,
+    storage: metrics.storage_usage_pct
+  });
+  if (telemetryHistory.length > 30) telemetryHistory.shift();
 
   try {
 
@@ -58,17 +119,60 @@ app.post('/api/telemetry', async (req, res) => {
   }
 });
 
+app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'revive-api', database: 'optional' }));
+
+app.get('/api/dashboard', (req, res) => {
+  const scores = getScores();
+  const performanceAge = Number((3.8 + Math.max(0, 100 - scores.overall) * .045).toFixed(1));
+  res.json({
+    device: latestTelemetry,
+    scores,
+    performance_age: performanceAge,
+    physical_age: 4.2,
+    recommendations: getRecommendations(),
+    latest_check: latestTelemetry.received_at,
+    mode: isTelemetryLive() ? 'live' : 'demo',
+    telemetry_stale: !isTelemetryLive()
+  });
+});
+
+app.get('/api/history', (req, res) => {
+  res.json({ history: telemetryHistory.slice(-12), prediction: { six_months: 71, twelve_months: 63 } });
+});
+
+app.post('/api/assistant', (req, res) => {
+  const question = String(req.body.question || '').toLowerCase();
+  const { metrics } = latestTelemetry;
+  const answers = question.includes('buy') || question.includes('replace')
+    ? { answer: 'Not yet. Your hardware is still capable of meeting this workload. Addressing storage and memory pressure should extend its useful life.', actions: ['Recover 15 GB of storage', 'Disable 4 startup applications', 'Reduce background activity'] }
+    : question.includes('fix') || question.includes('first')
+      ? { answer: 'Start with storage pressure, then reduce startup and background activity. Those changes target the largest contributors to the current slowdown.', actions: ['Free storage headroom', 'Disable non-essential startup apps', 'Review background processes'] }
+      : { answer: `Your device is not simply old. The main signals are ${metrics.storage_usage_pct > 85 ? 'storage pressure' : 'storage usage'}, ${metrics.ram_usage_pct > 75 ? 'memory pressure' : 'background activity'}, and startup load. ReVive estimates that targeted cleanup can restore noticeable responsiveness.`, actions: ['Run the recovery simulation', 'Review storage categories', 'Check memory-heavy processes'] };
+  res.json({ ...answers, question: req.body.question || '' });
+});
+
+app.post('/api/rescue', (req, res) => {
+  const current = getScores().overall;
+  const selected = Array.isArray(req.body.actions) ? req.body.actions : ['startup', 'storage', 'cache'];
+  const improvement = selected.reduce((total, action) => total + ({ startup: 12, storage: 8, cache: 5, background: 6 }[action] || 0), 0);
+  res.json({ current_health: current, projected_health: Math.min(98, current + improvement), current_boot_time: latestTelemetry.metrics.boot_time_sec, projected_boot_time: Math.max(18, latestTelemetry.metrics.boot_time_sec - (selected.length * 7)), estimated_life_extension_months: Math.min(24, 8 + selected.length * 3) });
+});
+
 // Fetch Latest Health Diagnosis
 app.get('/api/diagnostics/:deviceId', async (req, res) => {
   try {
-    const [rows] = await dbPool.query(
-      `SELECT * FROM telemetry_logs WHERE device_id = ? ORDER BY recorded_at DESC LIMIT 1`,
-      [req.params.deviceId]
-    );
-
-    if (rows.length === 0) return res.status(404).json({ error: "No metrics found" });
-
-    const latest = rows[0];
+    let latest;
+    try {
+      const [rows] = await dbPool.query(
+        `SELECT * FROM telemetry_logs WHERE device_id = ? ORDER BY recorded_at DESC LIMIT 1`,
+        [req.params.deviceId]
+      );
+      latest = rows[0];
+    } catch (dbError) {
+      console.warn('Diagnostics using live telemetry:', dbError.message);
+    }
+    if (!latest && latestTelemetry.device_id === req.params.deviceId) latest = { ...latestTelemetry.metrics, device_id: latestTelemetry.device_id };
+    if (!latest) return res.status(404).json({ error: "No metrics found" });
     const mlResponse = await axios.post(`${ML_SERVICE_URL}/analyze`, {
       cpu_usage_pct: latest.cpu_usage_pct,
       ram_usage_pct: latest.ram_usage_pct,
